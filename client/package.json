@@ -1,0 +1,20 @@
+{
+  "name": "chat-export-client",
+  "version": "1.0.0",
+  "description": "Local client for Google Chat Exporter — receives data from extension via WebSocket",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --watch src/cli.ts",
+    "start": "bun run src/cli.ts start",
+    "build": "bun build src/cli.ts --outdir dist --target bun",
+    "lint": "biome check src/",
+    "lint:fix": "biome check --write src/",
+    "format": "biome format --write src/",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.0",
+    "@types/bun": "^1.1.0",
+    "typescript": "^5.6.0"
+  }
+}
