@@ -3,12 +3,19 @@
  *
  * Listens on a configurable port (default 7890) and handles the full export
  * lifecycle: handshake, data streaming, and completion/error.
+ *
+ * Also exposes HTTP API endpoints for external tooling (e.g. agent skills):
+ *   GET  /api/status   — connection info
+ *   GET  /api/spaces   — list available spaces (async, waits for extension)
+ *   POST /api/export   — trigger an export
+ *   GET  /api/exports  — active + recently completed export progress
  */
 
 import type { ServerWebSocket } from "bun";
 import { type ClientConfig, expandTilde } from "./config.js";
 import {
 	type ExportCompleteMessage,
+	type ExportConfig,
 	type ExportDataMessage,
 	type ExportErrorMessage,
 	type ExportStartMessage,
@@ -16,7 +23,10 @@ import {
 	type HelloAckMessage,
 	PROTOCOL_VERSION,
 	type ProgressMessage,
+	type SpaceInfo,
 	type SpacesDataMessage,
+	type SpacesListRequestMessage,
+	type TriggerExportMessage,
 } from "./protocol.js";
 import { appendJsonl, bufferJsonTopics, flushJson, writeBatch } from "./writer.js";
 
@@ -34,6 +44,21 @@ interface ExportState {
 
 /** Active export states keyed by spaceId. */
 const activeExports = new Map<string, ExportState>();
+
+/** Recently completed exports (kept for 5 minutes for API consumers to poll). */
+interface CompletedExport {
+	spaceId: string;
+	spaceName?: string;
+	totalTopics: number;
+	totalMessages: number;
+	bytesWritten: number;
+	elapsedMs: number;
+	completedAt: number;
+}
+const recentlyCompleted = new Map<string, CompletedExport>();
+
+/** Pending promise resolver for the async GET /api/spaces endpoint. */
+let pendingSpacesResolve: ((spaces: SpaceInfo[]) => void) | null = null;
 
 /** Reference to the connected extension WebSocket (only one at a time). */
 let connectedSocket: ServerWebSocket<unknown> | null = null;
@@ -141,12 +166,23 @@ async function handleExportComplete(
 		console.log(`  Flushed JSON: ${result.filePath}`);
 	}
 
-	const elapsed = ((Date.now() - state.startedAt) / 1000).toFixed(1);
+	const elapsedMs = Date.now() - state.startedAt;
 	console.log(
 		`Export complete: ${state.spaceName ?? msg.spaceId} ` +
 			`(${msg.totalTopics} topics, ${msg.totalMessages} messages, ` +
-			`${(state.bytesWritten / 1024).toFixed(1)} KB, ${elapsed}s)`,
+			`${(state.bytesWritten / 1024).toFixed(1)} KB, ${(elapsedMs / 1000).toFixed(1)}s)`,
 	);
+
+	// Store in recently completed for API consumers (kept for 5 minutes)
+	recentlyCompleted.set(msg.spaceId, {
+		spaceId: msg.spaceId,
+		spaceName: state.spaceName,
+		totalTopics: msg.totalTopics,
+		totalMessages: msg.totalMessages,
+		bytesWritten: state.bytesWritten,
+		elapsedMs,
+		completedAt: Date.now(),
+	});
 
 	sendProgress(state);
 	activeExports.delete(msg.spaceId);
@@ -158,10 +194,33 @@ function handleExportError(msg: ExportErrorMessage): void {
 }
 
 function handleSpacesData(msg: SpacesDataMessage): void {
+	// Resolve pending HTTP request if any
+	if (pendingSpacesResolve) {
+		pendingSpacesResolve(msg.spaces);
+		pendingSpacesResolve = null;
+	}
+
 	console.log(`\nAvailable spaces (${msg.spaces.length}):`);
 	for (const space of msg.spaces) {
 		const label = space.type === "dm" ? "DM" : "Space";
 		console.log(`  [${label}] ${space.name ?? "(unnamed)"} — ${space.id}`);
+	}
+}
+
+// ─── HTTP Helpers ────────────────────────────────────────────────────────────
+
+function jsonResponse(data: unknown, status = 200): Response {
+	return new Response(JSON.stringify(data, null, 2), {
+		status,
+		headers: { "Content-Type": "application/json" },
+	});
+}
+
+/** Evict completed exports older than 5 minutes. */
+function pruneCompleted(): void {
+	const cutoff = Date.now() - 5 * 60 * 1000;
+	for (const [id, exp] of recentlyCompleted) {
+		if (exp.completedAt < cutoff) recentlyCompleted.delete(id);
 	}
 }
 
@@ -170,15 +229,111 @@ function handleSpacesData(msg: SpacesDataMessage): void {
 export function createServer(config: ClientConfig): ReturnType<typeof Bun.serve> {
 	const server = Bun.serve({
 		port: config.port,
-		fetch(req, server) {
+		async fetch(req, server) {
 			const url = new URL(req.url);
 
 			// Health check endpoint
 			if (url.pathname === "/health") {
-				return new Response(JSON.stringify({ status: "ok", version: PROTOCOL_VERSION }), {
-					headers: { "Content-Type": "application/json" },
+				return jsonResponse({ status: "ok", version: PROTOCOL_VERSION });
+			}
+
+			// ─── HTTP API ────────────────────────────────────────────────
+
+			// GET /api/status — connection info
+			if (url.pathname === "/api/status" && req.method === "GET") {
+				return jsonResponse({
+					connected: isExtensionConnected(),
+					version: PROTOCOL_VERSION,
+					activeExports: activeExports.size,
 				});
 			}
+
+			// GET /api/spaces — list available spaces (async: waits for extension response)
+			if (url.pathname === "/api/spaces" && req.method === "GET") {
+				if (!isExtensionConnected()) {
+					return jsonResponse({ error: "Extension not connected" }, 503);
+				}
+
+				try {
+					const spaces = await new Promise<SpaceInfo[]>((resolve, reject) => {
+						pendingSpacesResolve = resolve;
+						const timer = setTimeout(() => {
+							if (pendingSpacesResolve === resolve) {
+								pendingSpacesResolve = null;
+								reject(new Error("Timeout waiting for spaces data (15s)"));
+							}
+						}, 15_000);
+						// Clear timeout if resolved normally
+						const origResolve = resolve;
+						pendingSpacesResolve = (spaces) => {
+							clearTimeout(timer);
+							origResolve(spaces);
+						};
+						sendMessage({ type: "spaces:list" } as SpacesListRequestMessage);
+					});
+					return jsonResponse({ spaces });
+				} catch (err) {
+					return jsonResponse({ error: (err as Error).message }, 504);
+				}
+			}
+
+			// POST /api/export — trigger an export
+			if (url.pathname === "/api/export" && req.method === "POST") {
+				if (!isExtensionConnected()) {
+					return jsonResponse({ error: "Extension not connected" }, 503);
+				}
+
+				try {
+					const body = (await req.json()) as Partial<ExportConfig>;
+					if (!body.spaces || body.spaces.length === 0) {
+						return jsonResponse(
+							{ error: "Missing 'spaces' array in request body" },
+							400,
+						);
+					}
+
+					const exportConfig: ExportConfig = {
+						spaces: body.spaces,
+						format: body.format ?? config.format,
+						raw: body.raw ?? config.raw,
+						outputDir: body.outputDir ?? config.outputDir,
+						sinceUsec: body.sinceUsec,
+						untilUsec: body.untilUsec,
+					};
+
+					const msg: TriggerExportMessage = {
+						type: "trigger:export",
+						config: exportConfig,
+					};
+
+					sendMessage(msg);
+					return jsonResponse({ status: "started", config: exportConfig }, 202);
+				} catch (err) {
+					return jsonResponse({ error: (err as Error).message }, 400);
+				}
+			}
+
+			// GET /api/exports — active + recently completed exports
+			if (url.pathname === "/api/exports" && req.method === "GET") {
+				pruneCompleted();
+
+				const active = Array.from(activeExports.values()).map((state) => ({
+					spaceId: state.spaceId,
+					spaceName: state.spaceName,
+					format: state.format,
+					outputDir: state.outputDir,
+					totalTopics: state.totalTopics,
+					totalMessages: state.totalMessages,
+					bytesWritten: state.bytesWritten,
+					elapsedMs: Date.now() - state.startedAt,
+				}));
+
+				const completed = Array.from(recentlyCompleted.values());
+
+				return jsonResponse({ active, recentlyCompleted: completed });
+			}
+
+			// ─── WebSocket upgrade ───────────────────────────────────────
 
 			// WebSocket upgrade
 			if (url.pathname === "/ws") {
